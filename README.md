@@ -1,217 +1,103 @@
-# Async image processing
+# Image Processing dengan Async Worker
 
-Upload a JPG, PNG or WebP image (up to 20 MB). The API answers immediately with a `job_id`. A separate worker process resizes the image to at most 1280 px on its longest side, compresses it at 80% quality and converts it to WebP. The browser polls the job status and offers the WebP for download when it is ready.
+Aplikasi web untuk upload gambar (JPG, PNG, WebP, maks. 20 MB). API langsung membalas dengan `job_id`, lalu worker di background memproses gambar: resize maks. 1280 px di sisi terpanjang, kompresi kualitas 80%, dan konversi ke WebP. Frontend melakukan polling status dan menampilkan link download saat selesai.
 
-- **Frontend:** React 19 + Vite, TypeScript
-- **API:** Express 5, TypeScript (strict)
-- **Worker:** BullMQ consumer, sharp (libvips)
-- **Data:** PostgreSQL (job state), Redis (queue), SILO (S3-compatible object storage)
+**Stack:** React + Vite · Express 5 (TypeScript strict) · BullMQ + Redis · PostgreSQL · SILO (object storage S3-compatible) · sharp
 
-## Quick start
+## Cara Menjalankan
 
-Requirements: Docker with Compose v2.
+Butuh Docker dengan Compose v2.
 
 ```bash
 docker compose up --build
 ```
 
-Open **http://localhost:8080**. The first run builds the images, which takes a few minutes. After that the stack starts in about 15 seconds.
+Buka http://localhost:8080. Build pertama butuh beberapa menit.
 
-| What | Where |
-|---|---|
-| App (nginx: static files + `/api` proxy) | http://localhost:8080 (change with `WEB_PORT`) |
-| SILO console (browse stored images) | http://127.0.0.1:59001, user `silo-admin`, password `silo-dev-password` |
+- Tambah worker: `docker compose up -d --scale worker=3`
+- Stop: `docker compose down` (tambahkan `-v` untuk menghapus data)
+- Console SILO: http://127.0.0.1:59001 (user `silo-admin`, password `silo-dev-password`)
 
-- **More workers:** `docker compose up -d --scale worker=3`
-- **Stop:** `docker compose down`. Add `-v` to also delete the database, queue and stored images.
+## Alur Kerja
 
-## How it works
+1. Browser mengirim gambar ke `POST /api/jobs`.
+2. API mengecek ukuran dan tipe file, menyimpan file asli ke SILO, mencatat job (`pending`) di PostgreSQL, memasukkan `job_id` ke antrean BullMQ, lalu langsung membalas `202`.
+3. Worker mengambil job dari antrean, mengubah status menjadi `processing`, memproses gambar dengan sharp, menyimpan hasil WebP ke SILO, lalu mengubah status menjadi `completed` (atau `failed` beserta alasannya).
+4. Browser melakukan polling ke `GET /api/jobs/:id`, lalu mengunduh hasil dari `GET /api/jobs/:id/download`.
 
-```mermaid
-flowchart LR
-  Browser -->|"static files, /api"| nginx
-  nginx -->|/api| API
-  API --> Postgres[(PostgreSQL<br/>job state)]
-  API --> SILO[(SILO / S3<br/>originals, outputs)]
-  API -->|job id| Redis[(Redis<br/>BullMQ queue)]
-  Redis --> Worker
-  Worker --> Postgres
-  Worker --> SILO
-```
-
-```mermaid
-sequenceDiagram
-  participant B as Browser
-  participant A as API
-  participant W as Worker
-  B->>A: POST /api/jobs (multipart "file")
-  A->>A: check size and magic bytes
-  A->>A: store original in SILO, insert job (pending), enqueue id
-  A-->>B: 202 { job_id, status: "pending" }
-  W->>W: take id from queue, mark processing
-  W->>W: rotate (EXIF), fit inside 1280x1280, WebP q80
-  W->>W: store outputs/{id}.webp, mark completed
-  loop exponential backoff
-    B->>A: GET /api/jobs/{id}
-  end
-  B->>A: GET /api/jobs/{id}/download
-```
-
-Job lifecycle: `pending → processing → completed | failed`. PostgreSQL enforces it: a trigger rejects any other transition, and CHECK constraints require an output key on every completed job and an error message on every failed one.
-
-`docker-compose.yml` runs six long-running services plus a one-shot `setup`:
-
-- `web`: nginx serving the built UI and proxying `/api`.
-- `api` and `worker`: the same backend image with different commands.
-- `postgres`, `redis` and `silo`.
-- `setup`: a one-shot container that applies the SQL migrations and creates the bucket. `api` and `worker` start only after it succeeds.
+Urutan status: `pending → processing → completed / failed`, dijaga oleh trigger di PostgreSQL.
 
 ## API
 
-| Method and path | Success | Errors |
-|---|---|---|
-| `POST /api/jobs` (multipart, field `file`) | `202 {"job_id","status":"pending"}` plus a `Location` header | `400` no or malformed file, `413` over 20 MB, `415` not JPG/PNG/WebP, `503` queue unavailable |
-| `GET /api/jobs/:id` | `200 {"job_id","status","error"?}` | `404` unknown id |
-| `GET /api/jobs/:id/download` | `200 image/webp`, sent as an attachment | `404` unknown id, `409` not completed |
-| `GET /api/health` | `200 {"status":"ok"}` (database and Redis reachable) | `503` |
-
-Errors are JSON: `{"error": "<message safe to show the user>"}`. Every response carries an `X-Request-Id`, which also appears in the logs. 20 MB means 20 × 1024 × 1024 bytes.
-
-## Architecture decisions
-
-**The server delegates and the worker executes.** The API only validates, stores the original, records the job and queues it. Image processing happens only in the worker, a separate process and container. CPU-heavy work therefore never slows down uploads or status checks, and workers scale on their own (`--scale worker=N`). A lint rule rejects any import of the image processor in the API's entry point.
-
-**PostgreSQL holds the job state; BullMQ and Redis only deliver it.** The `image_jobs` table is the record the API reads, with constraints that keep it consistent. The queue carries nothing but job ids. BullMQ provides retries with backoff, detection of jobs abandoned by crashed workers, and concurrency control. Keeping state in two stores creates a gap where a job can be recorded but never queued. Three things close it:
-
-- If queuing fails, the API marks the job failed and answers 503, so no job is left `pending` forever.
-- The job id is also the BullMQ job id, so queuing the same job twice is a no-op.
-- Every 60 s, a reconciler in the worker re-queues `pending` jobs that the queue has lost (for example after an API crash or Redis data loss). It also fails jobs whose queue entry failed while the worker could not record it.
-
-A Postgres-only queue (`SELECT … FOR UPDATE SKIP LOCKED`) would avoid the second store, at the cost of hand-writing BullMQ's retry and crash handling.
-
-**Object storage instead of a shared disk.** The API and the worker share no filesystem, so they can run on different hosts. Locally, storage is SILO, a community fork of MinIO, with its image pinned because the project is young. The code uses the standard AWS S3 SDK, so AWS S3, Cloudflare R2 or similar work by changing configuration. Storage keys come from the job id (`originals/{id}`, `outputs/{id}.webp`), never from the uploaded file name.
-
-**Failures are part of the design.**
-
-| Situation | What happens |
+| Endpoint | Respons |
 |---|---|
-| Corrupt or undecodable image | Job fails at once with a readable reason; no retries. |
-| Storage or database error during processing | Up to 3 attempts, with 2 s and 4 s backoff; then failed with a clear message. |
-| Worker crashes mid-job | The job's lock expires (15 s). Another worker, or the restarted one, picks it up within about 15–30 s. Re-running a job is safe: finished jobs are skipped, the output key is fixed, and status updates are conditional. |
-| A job that crashes the worker every time | It is failed after 3 starts ("interrupted repeatedly") instead of crash-looping. |
-| `docker compose stop` | The worker finishes the job in progress before exiting; it gets 30 s. |
-| Huge image dimensions (decompression bomb) | Rejected above 100 megapixels, before decoding. |
+| `POST /api/jobs` (multipart, field `file`) | `202 {"job_id","status":"pending"}`. Error: `400`, `413` (> 20 MB), `415` (bukan JPG/PNG/WebP), `503` |
+| `GET /api/jobs/:id` | `200 {"job_id","status","error"?}`, atau `404` jika job tidak ada |
+| `GET /api/jobs/:id/download` | File WebP, atau `409` jika job belum selesai |
+| `GET /api/health` | `200` jika database dan Redis siap |
 
-**One encode for the image.** Rotate according to EXIF, fit inside 1280×1280 without enlarging smaller images, then encode WebP at quality 80. "Compress to 80%" and "convert to WebP" are a single lossy encode; doing two would only lose more detail. EXIF rotation runs first, so "longest side" refers to the image as people see it.
+Format error: `{"error": "pesan"}`.
 
-**Polling with exponential backoff.** The first status check comes after 500 ms. The delay grows ×1.5 per check, up to 5 s, and resets to 500 ms whenever the status changes. A job that just started processing is therefore checked again soon, while a long queue costs few requests. Up to 8 network or server errors in a row are retried silently; a client error such as 404 stops polling. Uploading another image, or leaving the page, cancels polling. Server-Sent Events would push updates instead, but polling is stateless and works through any proxy.
+## Keputusan Arsitektur
 
-**Validation at every boundary.** The browser checks type and size for instant feedback only. The server is authoritative: it enforces the size limit while receiving the upload, and identifies JPG, PNG and WebP by their magic bytes (the client's `Content-Type` and file extension are ignored). The database also checks type and size.
+- **API dan worker dipisah.** Keduanya memakai image yang sama, tetapi berjalan sebagai container terpisah. API hanya menerima, menyimpan, dan mengantre job; proses gambar yang berat hanya ada di worker. Jadi API tetap cepat, dan jumlah worker bisa ditambah sendiri.
+- **PostgreSQL untuk status, BullMQ + Redis untuk antrean.** BullMQ sudah menyediakan retry, backoff, dan deteksi job yang macet karena worker crash. Karena data ada di dua tempat, ada dua pengaman:
+  - Jika job gagal masuk antrean, API menandainya `failed` dan membalas `503`.
+  - Reconciler di worker (tiap 60 detik) mengantre ulang job `pending` yang hilang dari antrean.
+- **File disimpan di object storage, bukan disk bersama.** API dan worker tidak berbagi filesystem. Kode memakai AWS S3 SDK, jadi SILO bisa diganti AWS S3 atau Cloudflare R2 cukup lewat konfigurasi.
+- **Penanganan error di worker:**
+  - Gambar rusak: langsung `failed` dengan pesan yang jelas, tanpa retry.
+  - Error sementara (storage/database): retry 3 kali dengan jeda 2 dan 4 detik.
+  - Worker crash di tengah proses: job diambil ulang oleh worker lain atau oleh worker yang restart, dalam sekitar 15–30 detik.
+  - Job yang selalu membuat worker crash: dihentikan sebagai `failed` setelah 3 kali dicoba.
+  - `docker compose stop`: worker menyelesaikan job yang sedang berjalan sebelum berhenti.
+- **Polling dengan exponential backoff.** Jeda polling mulai dari 500 ms, dikali 1,5 setiap kali, maksimal 5 detik, dan kembali ke 500 ms setiap status berubah.
+- **Validasi di browser dan server.** Browser mengecek tipe dan ukuran agar pengguna langsung mendapat respons. Server tetap menjadi penentu: batas 20 MB, dan tipe file dicek dari isi file (magic bytes), bukan dari ekstensinya.
+- **Clean architecture.** Kode dibagi menjadi layer domain, application (use case dan interface), infrastructure (Postgres, S3, sharp, BullMQ), dan presentation/HTTP. Arah dependensi antar-layer dicek oleh lint (`oxlint`).
 
-**Clean architecture in both apps.**
+## Environment Variables
 
-- **Layers:** domain rules, then application use cases with ports (interfaces), then infrastructure adapters (HTTP client in the UI; Postgres, S3, sharp and BullMQ in the backend), then delivery (React, Express).
-- **Wiring:** each process has one composition root that connects adapters to use cases.
-- **Enforcement:** `oxlint` `no-restricted-imports` rules fail the lint when a layer imports outward.
-- **Testing:** use cases are tested with in-memory fakes; adapters are tested against real services.
+Dipakai oleh backend (api, worker, setup). Docker Compose sudah mengisi semuanya.
 
-**Job ids are random UUIDv4s.** The brief has no user accounts, so the id is the only key to a job's status and download. 122 random bits make ids impossible to enumerate.
-
-## Configuration
-
-The backend (`api`, `worker`, `setup`) is configured through environment variables. Startup fails with the variable's name if a required one is missing.
-
-| Variable | Required | Default | Purpose |
+| Variable | Wajib | Default | Keterangan |
 |---|---|---|---|
-| `DATABASE_URL` | yes | | PostgreSQL connection string |
-| `REDIS_URL` | yes | | Redis for BullMQ (`redis://` or `rediss://`) |
-| `S3_BUCKET` | yes | | Bucket for originals and outputs (created by `setup`) |
-| `S3_ACCESS_KEY_ID` | yes | | Object storage credentials |
-| `S3_SECRET_ACCESS_KEY` | yes | | Object storage credentials |
-| `S3_ENDPOINT` | no | AWS S3 | Set for S3-compatible servers such as SILO (enables path-style URLs) |
-| `S3_REGION` | no | `us-east-1` | |
-| `PORT` | no | `3000` | API port |
-| `WORKER_CONCURRENCY` | no | `1` | Jobs processed at once per worker process |
+| `DATABASE_URL` | ya | | Koneksi PostgreSQL |
+| `REDIS_URL` | ya | | Koneksi Redis untuk BullMQ |
+| `S3_BUCKET` | ya | | Bucket untuk file asli dan hasil |
+| `S3_ACCESS_KEY_ID` | ya | | Kredensial object storage |
+| `S3_SECRET_ACCESS_KEY` | ya | | Kredensial object storage |
+| `S3_ENDPOINT` | tidak | AWS S3 | Isi untuk SILO atau MinIO |
+| `S3_REGION` | tidak | `us-east-1` | |
+| `PORT` | tidak | `3000` | Port API |
+| `WORKER_CONCURRENCY` | tidak | `1` | Jumlah job yang diproses bersamaan per worker |
 
-`docker-compose.yml` sets all of these for the containers and needs no `.env` file. To override its defaults, export these variables or put them in a `.env` file next to `docker-compose.yml`:
+Opsional untuk Docker Compose: `WEB_PORT` (default `8080`), `POSTGRES_PASSWORD`, `SILO_ROOT_USER`, `SILO_ROOT_PASSWORD`. Kredensial default hanya untuk development.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `WEB_PORT` | `8080` | Host port of the app |
-| `POSTGRES_PASSWORD` | `app` | Database password |
-| `SILO_ROOT_USER`, `SILO_ROOT_PASSWORD` | `silo-admin`, `silo-dev-password` | SILO credentials, also used by the backend |
-| `WORKER_CONCURRENCY` | `1` | See above |
-| `POSTGRES_PORT`, `REDIS_PORT`, `SILO_API_PORT`, `SILO_CONSOLE_PORT` | `55432`, `56379`, `59000`, `59001` | Host ports, bound to 127.0.0.1 only |
+## Development Lokal
 
-The default credentials are for local development only. A real deployment needs real secrets and a storage key limited to the one bucket. The frontend needs no configuration: it calls the relative path `/api`.
-
-## Local development
-
-Run the app code on your machine and only the infrastructure in Docker. You need Node.js 22.12 or newer.
+Butuh Node.js 22.12 atau lebih baru.
 
 ```bash
 docker compose up -d postgres redis silo
-
-cd backend
-cp .env.example .env
-npm ci
-npm run setup          # migrations + bucket; safe to re-run
-npm run dev:api        # terminal 1, http://localhost:3000
-npm run dev:worker     # terminal 2
-
-cd ../web
-npm ci
-npm run dev            # http://localhost:5173, proxies /api to :3000
+cd backend && cp .env.example .env && npm ci && npm run setup
+npm run dev:api                      # terminal 1
+npm run dev:worker                   # terminal 2
+cd ../web && npm ci && npm run dev   # http://localhost:5173
 ```
 
-Don't run a local worker while the Docker `worker` service is up: both consume the same queue.
+Jangan jalankan worker lokal bersamaan dengan service `worker` di Docker, karena keduanya memakai antrean yang sama.
 
-## Tests
+## Testing
 
 ```bash
-cd web && npm test && npm run lint && npm run build
-cd backend && npm test && npm run lint && npm run typecheck
+cd web && npm test
+cd ../backend && npm test
 ```
 
-- **Web:** file validation; the polling policy (backoff, reset on status change, retry, give-up, cancel); the HTTP gateway's response mapping and error handling.
-- **Backend:**
-  - magic-byte detection;
-  - the use cases with in-memory fakes (upload, processing, permanent and transient failures, reconciliation);
-  - the HTTP API (status codes, limits, download headers);
-  - the sharp pipeline on real images (resize, no enlargement, EXIF rotation, corrupt files, decompression bombs).
-- **Backend integration tests** run when these variables are set, using a throwaway schema and queue:
+Integration test (dengan PostgreSQL dan Redis asli) ikut berjalan jika `TEST_DATABASE_URL` dan `TEST_REDIS_URL` diisi. Contohnya ada di `backend/.env.example`.
 
-  ```bash
-  docker compose up -d postgres redis
-  TEST_DATABASE_URL=postgres://app:app@127.0.0.1:55432/images \
-  TEST_REDIS_URL=redis://127.0.0.1:56379/15 npm test
-  ```
+## Batasan
 
-  They cover the Postgres repository (lifecycle trigger, constraints, conditional updates) and BullMQ (de-duplication, retries, then giving up).
-
-## Project structure
-
-```
-web/                React UI
-  src/domain/         upload rules, job model
-  src/application/    use cases: submit image, track job (polling policy); JobGateway port
-  src/infrastructure/ HTTP adapter for the API
-  src/presentation/   React components and hook
-  nginx.conf          production web server config
-backend/            API, worker and setup (one image)
-  src/domain/         image rules, job model
-  src/application/    use cases and ports (repository, storage, queue, image processor)
-  src/infrastructure/ Postgres, S3, sharp, BullMQ, config, logging, migration runner
-  src/http/           Express app
-  src/main/           entry points: api.ts, worker.ts, setup.ts
-  migrations/         plain SQL
-docker-compose.yml
-```
-
-## Limitations and next steps
-
-- Uploads are buffered in memory, up to 20 MB each. At high concurrency, stream them to S3 with a multipart upload.
-- There is no authentication or rate limiting. A real service would tie jobs to users and rate-limit uploads.
-- Downloads stream through the API. At scale, redirect to short-lived presigned S3 URLs.
-- Old jobs and objects are never deleted. An S3 lifecycle rule plus a cleanup job for old rows would fix that.
-- Observability is structured JSON logs with request and job ids. Next would be metrics: request rate, errors and duration; queue depth; retries.
+- Belum ada autentikasi dan rate limiting. `job_id` (UUID acak) menjadi satu-satunya kunci untuk mengakses job.
+- File upload disimpan sementara di memori (maks. 20 MB per file).
+- Job dan file lama belum dihapus otomatis.
