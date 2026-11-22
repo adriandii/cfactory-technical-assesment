@@ -1,0 +1,86 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "oxc", "node"],
+  "overrides": [
+    {
+      "files": ["src/domain/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "regex": "(^|/)(application|infrastructure|http|main)(/|$)|^(express|multer|pg|bullmq|ioredis|sharp|@aws-sdk/)",
+                "message": "Clean architecture: the domain layer depends on nothing."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/application/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "regex": "(^|/)(infrastructure|http|main)(/|$)|^(express|multer|pg|bullmq|ioredis|sharp|@aws-sdk/)",
+                "message": "Clean architecture: the application layer depends only on the domain; adapters implement its ports."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/infrastructure/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "regex": "(^|/)(http|main)(/|$)",
+                "message": "Clean architecture: infrastructure implements ports and never depends on delivery code."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/http/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "regex": "(^|/)(infrastructure|main)(/|$)|^(pg|bullmq|ioredis|sharp|@aws-sdk/)",
+                "message": "Clean architecture: HTTP handlers call use cases through ports; only src/main picks adapters."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/main/api.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "regex": "^sharp$|sharp-image-processor",
+                "message": "The API only delegates; image processing belongs to the worker."
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
